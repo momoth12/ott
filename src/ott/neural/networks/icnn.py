@@ -70,14 +70,14 @@ class ICNN(nnx.Module):
   options, and optional positive-definite quadratic potentials
   :cite:`vesseron:24`.
 
-  The network computes a convex function f: R^d -> R^k where convexity
-  holds component-wise when k > 1.
+  The network computes a convex function :math:`f: R^d -> R^k` where convexity
+  holds component-wise when :math:`k > 1`.
 
   Architecture::
 
     z_0 = act(W_x0 @ x)
-    z_i = act(W_z_i @ z_{i-1} + W_x_i @ x)   [wx_inject controls W_x_i]
-    out = z_N + pos_def_potentials(x)          [optional]
+    z_i = act(W_z_i @ z_{i-1} + W_x_i @ x)   # wx_inject controls W_x_i
+    out = z_N + pos_def_potentials(x)        # optional
 
   Convexity is enforced by requiring W_z_i >= 0 (via rectifier) and
   using convex activation functions.
@@ -85,19 +85,30 @@ class ICNN(nnx.Module):
   Args:
     dim_hidden: Sequence of hidden layer sizes. The output dimension
       defaults to 1 (scalar potential); set ``output_dim`` for vector output.
+    input_dim: Dimension of the input ``x``.
     output_dim: Output dimension. Defaults to 1 (scalar convex function).
       When > 1, each output component is convex in the input.
     rectifier_fn: Function applied to W_z kernels to enforce
-      non-negativity. The default is :func:`jax.nn.softplus`.
+      non-negativity. The default is :func:`~jax.nn.softplus`.
     act_fn: Activation function (must be convex for the network to be
-      convex). The default is :func:`jax.nn.relu`.
+      convex). The default is :func:`~jax.nn.relu`.
     wx_inject: Controls input re-injection at intermediate layers.
-      See :func:`_normalize_wx_inject`.
     use_bias: Whether to use bias terms.
+    use_softmax: If True, the ``W_z`` :class:`PositiveDense
+      <ott.neural.networks.layers.posdef.PositiveDense>` layers use
+      column-wise softmax normalization instead of ``rectifier_fn``.
+    use_sinkhorn: If True, the ``W_z`` :class:`PositiveDense
+      <ott.neural.networks.layers.posdef.PositiveDense>` layers use
+      Sinkhorn normalization instead of ``rectifier_fn``.
     pos_def_rank: Rank of optional PosDefPotentials term. Set to 0
       to disable (default).
+    principled_init: If True, override ``wz_kernel_init`` and the W_z
+      bias initializer with the principled ICNN initialization of
+      :cite:`hoedt:2023`, which controls correlation and variance
+      propagation through layers with positive weights.
     kernel_init: Initializer for W_x (unrestricted) weights.
-    wz_kernel_init: Initializer for W_z (positive) weights.
+    wz_kernel_init: Initializer for W_z (positive) weights. Ignored when
+      ``principled_init=True``.
     bias_init: Initializer for biases.
     rngs: Random number generators.
   """
@@ -121,6 +132,7 @@ class ICNN(nnx.Module):
       bias_init: nnx.initializers.Initializer = DEFAULT_BIAS_INIT,
       rngs: nnx.Rngs,
   ):
+    super().__init__()
     self._output_dim = output_dim
     self._act_fn_call = act_fn
 
@@ -167,7 +179,8 @@ class ICNN(nnx.Module):
             use_bias=False,
             kernel_init=kernel_init,
             rngs=rngs,
-        ) if inject else None for d_out, inject in zip(dims[2:], inject_mask)
+        ) if inject else None
+        for d_out, inject in zip(dims[2:], inject_mask, strict=True)
     ])
 
     self.wz_layers = nnx.List([
@@ -212,7 +225,7 @@ class ICNN(nnx.Module):
 
     z = self._act_fn_call(self.wx0(x))
 
-    for wx, wz in zip(self.wx_layers, self.wz_layers):
+    for wx, wz in zip(self.wx_layers, self.wz_layers, strict=True):
       if wx is not None:
         z = self._act_fn_call(wz(z) + wx(x))
       else:
@@ -233,15 +246,20 @@ class ICNN(nnx.Module):
     For vector output, returns the Jacobian.
 
     Args:
-      x: Input of shape ``[batch, input_dim]`` or ``[input_dim]``.
+      x: Input of shape ``[batch, input_dim]``.
 
     Returns:
       Gradients of shape ``[batch, input_dim]`` (scalar output) or
       ``[batch, output_dim, input_dim]`` (vector output).
     """
+
+    def forward(x: jax.Array) -> jax.Array:
+      return nnx.merge(graphdef, state)(x)
+
+    graphdef, state = nnx.split(self)
     if self._output_dim == 1:
-      return jax.vmap(jax.grad(self))(x)
-    return jax.vmap(jax.jacobian(self))(x)
+      return jax.vmap(jax.grad(forward))(x)
+    return jax.vmap(jax.jacobian(forward))(x)
 
   @property
   def is_potential(self) -> bool:
@@ -264,8 +282,11 @@ class KeyNet(nnx.Module):
 
   Args:
     dim_hidden: Sequence of hidden layer sizes.
-    output_dim: Output vector dimension. Typically, equals the input
-      dimension for gradient-of-potential interpretation.
+    input_dim: Dimension of the input ``x``.
+    output_dim: Output vector dimension. Defaults to ``input_dim``.
+      Typically, equals the input dimension for gradient-of-potential
+      interpretation.
+    num_outputs: Number of output vectors.
     resnet: If True, output ``x + F(x)`` instead of ``F(x)``.
     act_fn: Activation function.
     wx_inject: Controls input re-injection pattern.
@@ -283,6 +304,7 @@ class KeyNet(nnx.Module):
       *,
       input_dim: int,
       output_dim: Optional[int] = None,
+      num_outputs: Optional[int] = None,
       resnet: bool = False,
       act_fn: Callable[[jax.Array], jax.Array] = jax.nn.relu,
       wx_inject: Union[bool, Tuple[bool, ...], int] = True,
@@ -292,10 +314,14 @@ class KeyNet(nnx.Module):
       final_layer_scale: Optional[float] = None,
       rngs: nnx.Rngs,
   ):
+    super().__init__()
     self._resnet = resnet
     self._act_fn_call = act_fn
+    self._num_outputs = num_outputs
 
     output_dim = output_dim if output_dim is not None else input_dim
+    if self._num_outputs is not None:
+      output_dim = output_dim * self._num_outputs
     dims = [input_dim] + list(dim_hidden) + [output_dim]
     num_layers = len(dims) - 2
     inject_mask = _normalize_wx_inject(wx_inject, num_layers)
@@ -329,7 +355,8 @@ class KeyNet(nnx.Module):
             (i == num_layers - 1) else kernel_init,
             rngs=rngs
         ) if inject else None
-        for i, (d_out, inject) in enumerate(zip(dims[2:], inject_mask))
+        for i, (d_out,
+                inject) in enumerate(zip(dims[2:], inject_mask, strict=True))
     ])
 
     self.wz_layers = nnx.List([
@@ -341,37 +368,38 @@ class KeyNet(nnx.Module):
             (i == len(dims) - 3) else kernel_init,
             bias_init=bias_init,
             rngs=rngs,
-        ) for i, (d_in, d_out) in enumerate(zip(dims[1:-1], dims[2:]))
+        ) for i, (d_in,
+                  d_out) in enumerate(zip(dims[1:-1], dims[2:], strict=True))
     ])
 
   def __call__(self, x: jax.Array) -> jax.Array:
     """Compute scalar potential f(x) = <grad(x), x>.
 
     Args:
-      x: Input of shape ``[..., input_dim]``.
+      x: Input of shape ``[batch_size, input_dim]``.
 
     Returns:
-      Scalar output of shape ``[...]``.
+      Scalar output of shape ``[batch_size,]`` or ``[batch_size, num_outputs]``.
     """
     g = self.gradient(x)
-    return jnp.sum(g * x, axis=-1)
+    if self._num_outputs is None:
+      return jnp.sum(g * x, axis=-1)
+    return jnp.sum(g * x[:, None], axis=-1)
 
   def gradient(self, x: jax.Array) -> jax.Array:
     """Compute the vector output (predicted gradient / key).
 
     Args:
-      x: Input of shape ``[..., input_dim]``.
+      x: Input of shape ``[batch_size, input_dim]``.
 
     Returns:
-      Output of shape ``[..., output_dim]``.
+      Output of shape ``[batch_size, output_dim]`` or
+      ``[batch_size, num_outputs, output_dim]``.
     """
-    squeeze = x.ndim == 1
-    if squeeze:
-      x = x[None]
-
+    batch_size, _ = x.shape
     z = self._act_fn_call(self.wx0(x))
 
-    for wx, wz in zip(self.wx_layers, self.wz_layers):
+    for wx, wz in zip(self.wx_layers, self.wz_layers, strict=True):
       if wx is not None:
         z = self._act_fn_call(wz(z) + wx(x))
       else:
@@ -379,8 +407,9 @@ class KeyNet(nnx.Module):
 
     if self._resnet:
       z = x + z
-
-    return z.squeeze(0) if squeeze else z
+    if self._num_outputs is not None:
+      z = z.reshape(batch_size, self._num_outputs, -1)
+    return z
 
   @property
   def is_potential(self) -> bool:
